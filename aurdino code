@@ -1,0 +1,148 @@
+#include <EEPROM.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <DHT.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+#include <MPU6050.h>
+#include <MadgwickAHRS.h>
+#include <TinyGPS++.h>
+
+// ==================== CONFIG SECTION ====================
+struct Config {
+  // LoRa
+  uint8_t LORA_SCK   = 18;
+  uint8_t LORA_MISO  = 19;
+  uint8_t LORA_MOSI  = 23;
+  uint8_t LORA_SS    = 5;
+  uint8_t LORA_RST   = 14;
+  uint8_t LORA_DIO0  = 2;
+  long    LORA_FREQ  = 433E6;
+
+  // DHT11
+  uint8_t DHT_PIN    = 4;
+  uint8_t DHT_TYPE   = DHT11;
+
+  // MQ135
+  uint8_t MQ135_PIN  = 36; // ADC1_CH0
+
+  // I2C
+  uint8_t I2C_SDA    = 21;
+  uint8_t I2C_SCL    = 22;
+
+  // GPS
+  uint8_t GPS_RX     = 16; // ESP32 RX <- GPS TX
+  uint8_t GPS_TX     = 17; // ESP32 TX -> GPS RX
+  uint32_t GPS_BAUD  = 9600;
+};
+
+Config cfg;
+
+// ==================== SENSOR OBJECTS ====================
+DHT dht(cfg.DHT_PIN, cfg.DHT_TYPE);
+Adafruit_BMP085 bmp;
+Adafruit_HMC5883_Unified mag(12345);
+MPU6050 mpu;
+Madgwick filter;
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(2);
+
+// Flags
+bool hasMPU = false, hasMag = false, hasBMP = false, hasDHT = true, hasLoRa = false;
+
+// ==================== UTIL ====================
+void safeDelay(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    delay(1);
+    yield();
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(9600); // Match GUI.py baud
+  Serial.println("\n=== ESP32 Sensor Transmitter Boot ===");
+
+  // I2C init
+  Wire.begin(cfg.I2C_SDA, cfg.I2C_SCL);
+  safeDelay(50);
+
+  // MPU6050
+  mpu.initialize();
+  safeDelay(20);
+  hasMPU = mpu.testConnection();
+  Serial.println(hasMPU ? "MPU6050 OK" : "MPU6050 not detected");
+
+  // Magnetometer
+  hasMag = mag.begin();
+  Serial.println(hasMag ? "HMC5883L OK" : "HMC5883L not detected");
+
+  // BMP180
+  hasBMP = bmp.begin();
+  Serial.println(hasBMP ? "BMP180 OK" : "BMP180 not detected");
+
+  // DHT11
+  dht.begin();
+  Serial.println("DHT11 initialized");
+
+  // GPS
+  GPSSerial.begin(cfg.GPS_BAUD, SERIAL_8N1, cfg.GPS_RX, cfg.GPS_TX);
+  Serial.println("GPS started");
+
+  // LoRa
+  SPI.begin(cfg.LORA_SCK, cfg.LORA_MISO, cfg.LORA_MOSI, cfg.LORA_SS);
+  LoRa.setPins(cfg.LORA_SS, cfg.LORA_RST, cfg.LORA_DIO0);
+  hasLoRa = LoRa.begin(cfg.LORA_FREQ);
+  Serial.println(hasLoRa ? "LoRa OK" : "LoRa failed");
+
+  // Madgwick filter
+  filter.begin(100.0f);
+}
+
+// ==================== READ AND SEND ====================
+void readSensorsAndSend() {
+  // --- DHT11 ---
+  float dhtT = dht.readTemperature();
+  float dhtH = dht.readHumidity();
+  if (isnan(dhtT) || isnan(dhtH)) {
+    dhtT = NAN;
+    dhtH = NAN;
+    hasDHT = false;
+  }
+
+  // --- BMP180 ---
+  float btemp = NAN, pressure = NAN;
+  if (hasBMP) {
+    btemp = bmp.readTemperature();
+    pressure = bmp.readPressure() / 100.0;
+  }
+
+  // --- MQ135 ---
+  int mqRaw = analogRead(cfg.MQ135_PIN);
+
+  // --- Prepare payload for GUI ---
+  String payload = "Received: ";
+  payload += (isnan(dhtT) ? "NA" : String(dhtT, 2)) + ",";
+  payload += (isnan(dhtH) ? "NA" : String(dhtH, 2)) + ",";
+  payload += (isnan(btemp) ? "NA" : String(btemp, 2)) + ",";
+  payload += (isnan(pressure) ? "NA" : String(pressure, 2)) + ",";
+  payload += String(mqRaw);
+
+  Serial.println(payload);
+
+  // --- Send over LoRa if available ---
+  if (hasLoRa) {
+    LoRa.beginPacket();
+    LoRa.print(payload);
+    LoRa.endPacket();
+  }
+}
+
+// ==================== LOOP ====================
+void loop() {
+  readSensorsAndSend();
+  safeDelay(500);
+}
